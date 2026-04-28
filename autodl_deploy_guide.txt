@@ -1,0 +1,291 @@
+# DeepCiteFact AutoDL 部署修改清单
+
+## 前置准备
+
+### 1. 在本地修改以下 4 个文件，然后整体上传到 AutoDL
+
+```bash
+# 打包命令（在项目根目录执行）
+cd C:\Users\111\Desktop\简历\三个\飞书\DeepCiteFact
+tar -czf DeepCiteFact.tar.gz \
+    data/ \
+    verl/verl/trainer/config/search_grpo.yaml \
+    verl/scripts/run_grpo.sh \
+    eval/ \
+    LlamaFactory/
+```
+
+---
+
+## 修改 1: run_grpo.sh (line 9-14)
+
+### 方案 A：使用 API（推荐，省 8 卡显存）
+
+**原配置：**
+```bash
+export CLAIM_SERVER=127.0.0.1:8000
+export CLAIM_SERVER_PATH=Qwen2.5-32B-Instruct
+
+export CHECK_SERVER=127.0.0.1:8001
+export CHECK_SERVER_PATH=Qwen2.5-32B-Instruct
+```
+
+**改为 SiliconFlow API：**
+```bash
+# 获取 API Key: https://cloud.siliconflow.cn/account/accessToken
+export SILICONFLOW_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+
+export CLAIM_SERVER=https://api.siliconflow.cn/v1/chat/completions
+export CLAIM_SERVER_PATH=Qwen/Qwen2.5-32B-Instruct
+
+export CHECK_SERVER=https://api.siliconflow.cn/v1/chat/completions
+export CHECK_SERVER_PATH=Qwen/Qwen2.5-32B-Instruct
+```
+
+**或 DeepSeek API：**
+```bash
+# 获取 API Key: https://platform.deepseek.com/api_keys
+export DEEPSEEK_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+
+export CLAIM_SERVER=https://api.deepseek.com/v1/chat/completions
+export CLAIM_SERVER_PATH=deepseek-chat
+
+export CHECK_SERVER=https://api.deepseek.com/v1/chat/completions
+export CHECK_SERVER_PATH=deepseek-chat
+```
+
+### 方案 B：本地部署 7B（如果不放心 API）
+
+**改为 7B 版：**
+```bash
+export CLAIM_SERVER=127.0.0.1:8000
+export CLAIM_SERVER_PATH=/root/autodl-tmp/models/Qwen2.5-7B-Instruct
+
+export CHECK_SERVER=127.0.0.1:8001
+export CHECK_SERVER_PATH=/root/autodl-tmp/models/Qwen2.5-7B-Instruct
+```
+
+---
+
+## 修改 2: run_grpo.sh (line 19-21)
+
+**原配置：**
+```bash
+TRAIN_FILE="/root/output/DeepCiteFact/data/rl_train_data_filter_grpo.parquet"
+TEST_FILE=$TRAIN_FILE
+ACTOR_MODEL_PATH="/root/output/DeepCiteFact-SFT/DeepCiteFact-SFT-epoch4"
+```
+
+**改为 AutoDL 路径：**
+```bash
+TRAIN_FILE="/root/autodl-tmp/DeepCiteFact/data/rl_train_data_filter_grpo.parquet"
+TEST_FILE=$TRAIN_FILE
+ACTOR_MODEL_PATH="/root/autodl-tmp/models/Qwen3-8B"  # 如果没有 SFT，直接用基座
+```
+
+---
+
+## 修改 3: run_grpo.sh (line 23)
+
+**原配置：**
+```bash
+SAVE_PATH="/root/output/DeepCiteFact-GRPO-ckpts"
+```
+
+**改为：**
+```bash
+SAVE_PATH="/root/autodl-tmp/output/DeepCiteFact-GRPO"
+```
+
+---
+
+## 修改 4: run_grpo.sh (line 69)
+
+**原配置：**
+```bash
+actor_rollout_ref.rollout.tensor_model_parallel_size=4
+```
+
+**如果只用 4 卡 rollout（不共用 verifier），保持 4 不变**
+**如果用 6 卡（rollout 4 + verifier 2），也保持 4**
+
+---
+
+## 修改 5: search_grpo.yaml（如果有这个文件）
+
+检查 `data.max_prompt_length` 和 `data.max_response_length`：
+```yaml
+data:
+  max_prompt_length: 2048  # 如果显存不够，降到 1024
+  max_response_length: 8192  # 如果显存不够，降到 4096
+```
+
+---
+
+## AutoDL 启动步骤
+
+### Step 1: 上传文件
+```bash
+# 在 AutoDL 终端执行
+mkdir -p /root/autodl-tmp/DeepCiteFact
+cd /root/autodl-tmp/DeepCiteFact
+
+# 上传后解压
+tar -xzf DeepCiteFact.tar.gz
+```
+
+### Step 2: 下载模型（如果用 API，跳过这步）
+
+**如果用 API 替代 Verifier：**
+```bash
+# 只需要下载 Actor 模型（Qwen3-8B）
+mkdir -p /root/autodl-tmp/models
+cd /root/autodl-tmp/models
+
+# 方法 1: HuggingFace（如果能连）
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-8B
+
+# 方法 2: ModelScope（国内更快）
+pip install modelscope
+modelscope download Qwen/Qwen3-8B --local_dir ./Qwen3-8B
+```
+
+**如果本地部署 7B Verifier（不用 API）：**
+```bash
+# 额外下载 Qwen2.5-7B-Instruct
+git clone https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
+# 或
+modelscope download Qwen/Qwen2.5-7B-Instruct --local_dir ./Qwen2.5-7B-Instruct
+```
+
+### Step 3: 安装依赖
+```bash
+cd /root/autodl-tmp/DeepCiteFact/verl
+pip install -e .
+
+# 安装 vllm（先装这个）
+pip install vllm==0.5.4
+
+# 安装 sglang
+pip install "sglang[all]==0.4.9.post6"
+
+# 如果用 API，安装 requests
+pip install requests
+```
+
+### Step 4: 启动 Verifier 服务（仅本地部署需要，API 方案跳过）
+
+**终端 1（CUDA_VISIBLE_DEVICES=0,1）：**
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+CUDA_VISIBLE_DEVICES=0,1 python -m vllm.entrypoints.openai.api_server \
+--model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+--host 0.0.0.0 \
+--port 8000 \
+--tensor-parallel-size 2 \
+--trust-remote-code \
+--gpu-memory-utilization 0.9 \
+--max-num-seqs 256
+```
+
+**终端 2（CUDA_VISIBLE_DEVICES=2,3）：**
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+CUDA_VISIBLE_DEVICES=2,3 python -m vllm.entrypoints.openai.api_server \
+--model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+--host 0.0.0.0 \
+--port 8001 \
+--tensor-parallel-size 2 \
+--trust-remote-code \
+--gpu-memory-utilization 0.9 \
+--max-num-seqs 256
+```
+
+### Step 5: 测试 DDGS 搜索（重要！）
+```bash
+cd /root/autodl-tmp/DeepCiteFact/verl
+python verl/tools/search_utils/tools.py
+```
+
+**预期输出：**
+```
+google search query_list: ['北京大学 简介'], time taken: 2.3 seconds
+<snippet id=S_zz1TW0v>
+Title: 北京大学
+URL: https://en.wikipedia.org/wiki/北京大学
+Text: Peking University (PKU) is a public university in Haidian, Beijing...
+</snippet>
+```
+
+如果报错，修改 `verl/tools/search_utils/tools.py` 添加代理：
+```python
+with DDGS(proxy='http://127.0.0.1:7890', timeout=180) as _ddgs:
+```
+
+### Step 6: 启动 GRPO 训练
+```bash
+cd /root/autodl-tmp/DeepCiteFact/verl
+bash scripts/run_grpo.sh
+```
+
+---
+
+## 上传文件清单（最小集）
+
+**必须上传（~40GB）：**
+```
+DeepCiteFact/
+├── data/
+│   ├── rl_train_data_filter_grpo.parquet  (582MB)
+│   └── sft_trace_filter.jsonl  (32MB, 可选)
+├── verl/
+│   ├── verl/trainer/config/search_grpo.yaml  (修改后)
+│   ├── verl/tools/search_utils/tools.py
+│   └── scripts/run_grpo.sh  (修改后)
+└── eval/  (可选，评估时用)
+```
+
+**不需要上传：**
+- LLaMA-Factory/ （太大，28GB，用不到）
+- rollout_data_n*/ （训练中间产物，没必要）
+- tensorboard_log/ （重新训练会生成新的）
+
+---
+
+## 成本估算
+
+| 配置 | Verifier 方案 | 卡数 | 单价/小时 | 预计时长 | 总成本 | 适用场景 |
+|------|--------------|------|----------|---------|--------|----------|
+| **API 方案（快速验证）** | SiliconFlow API | 4 | ¥3.5×4=¥14 | 2.5h | **¥35** (含 API 费) | 调试/原型验证 |
+| **本地 7B（推荐）** | Qwen2.5-7B-Instruct | 6 | ¥3.5×6=¥21 | 1.5h | **¥32** | 完整训练 |
+| 本地 32B | Qwen2.5-32B-Instruct | 8 | ¥12×8=¥96 | 1h | **¥96** | 追求最佳效果 |
+
+**API 成本估算**：5000 条 × 8 samples × 2 turns × 200 tokens × ¥0.01/1k ≈ ¥16
+
+⚠️ **注意**：API 方案训练时间更长（网络延迟），且可能遇到 rate limit。建议先用 API 跑 10 steps 验证流程，再切换到本地部署完成训练。
+
+**建议：先租 6×4090 跑通流程（¥32），验证后再考虑上 A100**
+
+---
+
+## 常见问题
+
+### Q1: 没有 SFT checkpoint 能直接跑吗？
+**可以！** 直接用基座 Qwen3-8B 开始 RL 训练（只是收敛会慢一点）
+
+### Q2: 训练到一半断了怎么办？
+设置 `trainer.resume_mode="auto"`，会自动从最近 checkpoint 恢复
+
+### Q3: 显存爆了怎么办？
+降低 batch_size 或 max_length：
+```yaml
+data:
+  train_batch_size: 32  # 从 64 降到 32
+  max_response_length: 4096  # 从 8192 降到 4096
+```
+
+### Q4: Reward 一直是 0 怎么办？
+检查 DDGS 搜索是否正常（Step 5），以及 Verifier 服务是否启动（curl http://127.0.0.1:8000/v1/models）
